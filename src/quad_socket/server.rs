@@ -1,4 +1,4 @@
-use std::net::ToSocketAddrs;
+use std::net::{ToSocketAddrs, SocketAddr};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,7 @@ where
 }
 
 enum Sender<'a> {
-    WebSocket(&'a ws::Sender),
+    WebSocket((&'a ws::Sender, SocketAddr)),
     Tcp(&'a mut TcpStream),
 }
 
@@ -36,7 +36,7 @@ impl<'a> Sender<'a> {
         use std::io::Write;
 
         match self {
-            Sender::WebSocket(out) => {
+            Sender::WebSocket((out, _)) => {
                 out.send(data).ok()?;
             }
             Sender::Tcp(stream) => {
@@ -46,6 +46,17 @@ impl<'a> Sender<'a> {
         }
 
         Some(())
+    }
+
+    fn address(&self) -> SocketAddr {
+        match self {
+            Sender::WebSocket((_, addr)) => {
+                *addr
+            }
+            Sender::Tcp(stream) => {
+                stream.peer_addr().expect("tcp socket with no address, wtf")
+            }
+        }
     }
 }
 
@@ -69,6 +80,8 @@ impl<'a> SocketHandle<'a> {
     pub fn disconnect(&mut self) {
         self.disconnect = true;
     }
+
+    pub fn address(&self) -> SocketAddr { self.sender.address() }
 }
 
 pub fn listen<A, A1, F, F1, F2, S>(tcp_addr: A, ws_addr: A1, settings: Settings<F, F1, F2, S>)
@@ -92,7 +105,7 @@ where
         F2: Fn(&S) + Send + 'static,
     > {
         out: ws::Sender,
-        state: S,
+        state: (S, SocketAddr),
         on_message: Arc<Mutex<F>>,
         on_timer: Arc<Mutex<F1>>,
         on_disconnect: Arc<Mutex<F2>>,
@@ -106,17 +119,9 @@ where
             F2: Fn(&S) + Send + 'static,
         > ws::Handler for WsHandler<S, F, F1, F2>
     {
-        fn on_message(&mut self, msg: ws::Message) -> ws::Result<()> {
-            let data = msg.into_data();
-            let mut handle = SocketHandle::new(Sender::WebSocket(&self.out));
-            (self.on_message.lock().unwrap())(&mut handle, &mut self.state, data);
-            if handle.disconnect {
-                self.out.close(ws::CloseCode::Normal)?;
-            }
-            Ok(())
-        }
+        fn on_open(&mut self, handshake: ws::Handshake) -> ws::Result<()> {
+            self.state.1 = handshake.peer_addr.expect("no peer address in the handshake");
 
-        fn on_open(&mut self, _: ws::Handshake) -> ws::Result<()> {
             if let Some(timeout) = self.timeout {
                 self.out
                     .timeout(timeout.as_millis() as _, ws::util::Token(1))?;
@@ -124,10 +129,24 @@ where
             Ok(())
         }
 
+        fn on_message(&mut self, msg: ws::Message) -> ws::Result<()> {
+            let data = msg.into_data();
+            let mut handle = SocketHandle::new(Sender::WebSocket((&self.out, self.state.1)));
+            (self.on_message.lock().unwrap())(&mut handle, &mut self.state.0, data);
+            if handle.disconnect {
+                self.out.close(ws::CloseCode::Normal)?;
+            }
+            Ok(())
+        }
+
+        fn on_close(&mut self, _code: ws::CloseCode, _reason: &str) {
+            (self.on_disconnect.lock().unwrap())(&self.state.0);
+        }
+
         fn on_timeout(&mut self, _: ws::util::Token) -> ws::Result<()> {
             if let Some(timeout) = self.timeout {
-                let mut handle = SocketHandle::new(Sender::WebSocket(&self.out));
-                (self.on_timer.lock().unwrap())(&mut handle, &self.state);
+                let mut handle = SocketHandle::new(Sender::WebSocket((&self.out, self.state.1)));
+                (self.on_timer.lock().unwrap())(&mut handle, &self.state.0);
                 if handle.disconnect == false {
                     self.out
                         .timeout(timeout.as_millis() as _, ws::util::Token(1))?;
@@ -136,10 +155,6 @@ where
                 }
             }
             Ok(())
-        }
-
-        fn on_close(&mut self, _code: ws::CloseCode, _reason: &str) {
-            (self.on_disconnect.lock().unwrap())(&self.state);
         }
     }
 
@@ -162,7 +177,7 @@ where
 
                     WsHandler {
                         out,
-                        state: S::default(),
+                        state: (Default::default(), SocketAddr::from(([0, 0, 0, 0], 0))),
                         on_message,
                         on_timer,
                         on_disconnect,
